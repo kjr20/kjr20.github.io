@@ -1,0 +1,336 @@
+---
+title: "Assignment 5"
+author: "Kimberly Juarez-Rico"
+date: "10/24/2020"
+output: html_document
+---
+
+This report analyzes the accessibility of ballot drop off location sites for 
+Sonoma County residents by race.
+
+This report uses Mapbox, a data and mapping service, that allows open source
+map data for educational purposes by proving an access token. ACS 2018 CBG data 
+is also used for this analysis
+
+The objective in this report is to use Mapbox API, an R library, to map how
+accessible services are to a population group.
+
+
+```{r setup, include = F}
+knitr::opts_chunk$set(warning = F, message = F, echo = T, eval = T)
+```
+
+Downloaded necessary packages:
+
+```{r}
+library(lehdr)
+library(mapboxapi)
+library(tidyverse)
+library(tigris)
+library(sf)
+library(leaflet)
+library(censusapi)
+library(janitor)
+```
+
+Used Census key and Mapbox access token:
+
+```{r}
+Sys.setenv(CENSUS_KEY="4f290b276a2a5526b13d917c76884e70b99ba725")
+mb_access_token("pk.eyJ1Ijoia2p1YXJlenJpY28iLCJhIjoiY2tnamx6YXUyMDhlZTMxbDh3cjR2cnJzcSJ9.GfWXcAN9I6phMo8Kg08pFw")
+readRenviron("~/.Renviron")
+```
+
+The next step in the analysis is to prepare locations for isochrones.
+
+Load in Bay Area Community Data:
+
+```{r}
+BAC_database <- read_csv("SFBI Database.csv")
+```
+
+Get zip codes for Sonoma County only from Zip Code Tabulation Areas (ZCTA):
+
+```{r}
+usa_zips <- 
+  zctas(cb = T, progress_bar = F)
+
+ca_counties <- counties("CA", cb = T, progress_bar = F)
+
+soco <- "Sonoma"
+  
+soco_filter <-
+  counties("CA", cb = T, progress_bar = F) %>%
+  filter(NAME %in% soco)  
+
+soco_zips <-
+  usa_zips %>% 
+  st_centroid() %>% 
+  .[soco_filter, ] %>% 
+  st_set_geometry(NULL) %>% 
+  left_join(usa_zips %>% select(GEOID10)) %>% 
+  st_as_sf()
+```
+
+Modify BAC Database so that it only shows ballot drop off locations and 
+zip codes in Sonoma County:
+
+```{r}
+BAC_soco_polling <-
+  BAC_database %>% 
+  filter(taxonomy %in% 
+      c(
+        "Ballot Drop Off"
+      )
+  ) %>% 
+  mutate(
+    zipcode = `Zip Code (from address) (from locations) 3` %>% as.character()
+  ) %>% 
+  group_by(Name, `Zip Code (from address) (from locations) 3`, taxonomy,
+           active) %>% 
+  right_join(
+    soco_zips %>% select(GEOID10),
+    by = c("zipcode" = "GEOID10")
+  ) %>% 
+  st_as_sf() %>% 
+  st_transform(4326)%>%
+  select(!geometry)
+
+BAC_soco_polling
+```
+
+Remove empty columns:
+
+```{r}
+BAC_soco_polling_filter <-
+  BAC_soco_polling%>%
+  select(Name, zipcode, taxonomy, active,
+  `address_1 (from address) (from locations) 2`, `latitude (from locations) 2`,
+  `longitude (from locations) 2`)
+```
+
+Create a final data set that filters out empty rows:
+
+```{r}
+BAC_soco_polling_final <-
+BAC_soco_polling_filter[1:21, ]
+
+BAC_soco_polling_final
+```
+
+Creates a 10 minute walking distance isochrone for Sonoma County Ballot Drop Off
+Location:
+
+```{r}
+walk_10min <- mb_isochrone(
+  BAC_soco_polling_final,
+  profile = "walking",
+  time = 10
+)
+
+soco_polling_walk_10min <-
+  BAC_soco_polling_final %>% 
+  st_set_geometry(NULL) %>% 
+  cbind(walk_10min$geometry) %>% 
+  st_as_sf()
+```
+
+Creates a map using mapbox api isochrones for a 10 minute walking distance 
+from a ballot drop off location in Sonoma County: 
+
+```{r}
+leaflet() %>% 
+  addMapboxTiles(
+    style_id = "streets-v11",
+    username = "mapbox"
+  ) %>%
+  addPolygons(
+    data = soco_polling_walk_10min,
+    label = ~Name
+  )
+```
+
+Second part of the analysis is to use ACS data that divides populations by race from 
+the years 2017 to estimate if there is a relationship between the race 
+of people in Sonoma County and if they are able to access a ballot drop off location within 
+a 10 minute walking time. 
+
+I was not able to find 2017 ACS data at the Census Block Group level so I chose to use
+2018 5 year ACS data which includes 2017.
+
+Sonoma County Census Block Groups without duplicates:
+
+```{r}
+soco_bg <- 
+  block_groups("CA","097", cb = T, progress_bar = F) %>% 
+  st_transform(26910) %>% 
+  mutate(original_area = st_area(.))
+```
+
+Load ACS 2018 5 year data that includes patterns for the years 2014-2018
+and will include 2017 Census Block Group data:
+
+```{r}
+acs_vars_2018_5yr <-
+  listCensusMetadata(
+    name = "2018/acs/acs5",
+    type = "variables"
+  )
+```
+
+Census code B02001 = Race 
+
+Brings in Census Block Group data and filters groups by race:
+
+```{r}
+soco_bg_race <-
+  getCensus(
+    name = "acs/acs5",
+    vintage = 2018,
+    region = "block group:*", 
+    regionin = "state:06+county:097",
+    vars = "group(B02001)"
+  ) %>% 
+  mutate(cbg = paste0(state,county,tract,block_group)) %>% 
+  select(!c(GEO_ID,state,county,tract,block_group,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2018_5yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  ) %>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"race"),
+    sep = "!!"
+  ) %>% 
+  filter(!is.na(race)) %>% 
+  mutate(
+    race = case_when(
+      race %in% c("White alone") ~ "White, Alone",
+      race %in% c("Black or African American alone") ~ "Black or African American Alone",
+      race %in% c("Asian alone") ~ "Asian Alone",
+      race %in% c("American Indian and Alaska Native alone") ~ "American Indian and Alaska Native Alone",
+      race %in% c("Native Hawaiian or Other Pacific Islander Alone") ~ "Native Hawaiian or Other Pacific Islander",
+      race %in% c("Two or more races") ~"Two or More Race Groups",
+      race %in% c("Some other race alone") ~"Some Other Race Alone",
+      TRUE ~ race
+    )
+  )
+```
+
+Estimates the population totals for each racial group and creates a 
+perscentage calculation of each group divided by the total population:
+
+```{r}
+soco_race_totals <-
+  soco_bg_race %>% 
+  mutate(race = factor(race, levels = unique(soco_bg_race$race))) %>% 
+  group_by(race) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  mutate(
+    perc = estimate/sum(estimate),
+    group = "Full Population"
+  )
+```
+
+Creates the intersects of Sonoma County Block Groups and areas within a 10 minute
+walking distance of a polling place in Sonoma County:
+
+```{r}
+soco_bg_isochrone_intersect <-
+  soco_bg %>% 
+  st_intersection(
+    soco_polling_walk_10min %>% 
+      st_union() %>% 
+      st_transform(26910)
+  ) %>% 
+  mutate(
+    leftover_area = st_area(.),
+    perc_area = leftover_area / original_area
+  )
+```
+
+Creates a new data set that takes the Census Block Group of each value in the 
+racial catergory and matches the isochrones within that data set to 
+the isochrones of 10 minutes of walking distance to a ballot drop off location
+in Sonoma County:
+
+```{r}
+soco_poll_race <-
+  soco_bg_race %>% 
+  mutate(race = factor(race, levels = unique(soco_bg_race$race))) %>% 
+  left_join(
+    soco_bg_isochrone_intersect %>% 
+      select(cbg = GEOID, perc_area) %>% 
+      st_set_geometry(NULL)
+  ) %>% 
+  filter(!is.na(perc_area)) %>% 
+  mutate(
+    estimate = estimate * perc_area
+  ) %>% 
+  group_by(race) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  mutate(
+    perc = estimate/sum(estimate),
+    group = "Population within 10 min. walk of Ballot Drop Off"
+  )
+```
+
+Renders 2 charts:
+
+The first chart shows the full population that has access to ballot drop of locations in Sonoma County
+by race.
+
+The second chart shows the access that the population that has access to ballet drop off locations that are within a 10 minute walking time isochrone in Sonoma County by race.
+
+```{r}
+rbind(soco_race_totals,soco_poll_race) %>% 
+  ggplot(
+    aes(
+      x = "", 
+      y = perc, 
+      fill = reorder(race,desc(race))
+    )
+  ) + 
+  geom_bar(
+    stat = "identity", 
+    position = position_fill()
+  ) +
+  geom_text(
+    aes(label = paste0(round(perc*100),"%")), 
+    position = position_fill(vjust = 0.4), size = 2,
+  ) +
+  coord_polar(theta = "y") +
+  facet_wrap(~ group)  +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    legend.position = 'bottom'
+  ) + 
+  guides(
+    fill = guide_legend(nrow=3, byrow=TRUE)
+  ) +
+  labs(
+    fill = "Race"
+  )
+```
+
+According to the analysis, White households in Sonoma County have a 3% higher chance of living within in 10 minute walking distance to a ballot drop off location in Sonoma County and the racial group defined as "Some Other Race Alone" has a 3% lower chance of living within a 10 minute walking of a polling place by household. The other racial group have about 1% less probability to live within a 10 minute walking distance from a ballot drop off location. Overall, this analysis can help Sonoma County decision makers determine if they should increase their number of ballot drop off locations. 
+
+Sources:
+
+BayAreaCommunity.org
+
+unboxproject.org
+
+https://dcl-covid-19.github.io/mega-map-dev/#/
+
+https://www.mapbox.com/
+
+https://www.census.gov/programs-surveys/geography/guidance/geo-areas/zctas.html
